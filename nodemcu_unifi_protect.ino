@@ -24,25 +24,31 @@
  *
  * Board: NodeMCU 1.0 (ESP-12E Module)
  *
- * ⚠ UniFi consoles use self-signed TLS certificates. This sketch disables
- *   certificate verification (setInsecure). Use only on a trusted LAN.
+ * ⚠ GET (UniFi console) uses setInsecure() – self-signed cert, LAN use only.
+ *   POST (cloud endpoint) uses full TLS certificate verification via the
+ *   built-in CA bundle shipped with the ESP8266 board package.
  *
  * UniFi Protect API response structure (relevant fields):
  * {
  *   "id": "...",
  *   "state": "CONNECTED",
  *   "stats": {
- *     "temperature": { "value": 22.5 },   // °C
- *     "humidity":    { "value": 58.3 },   // %
- *     "light":       { "value": 412  }    // lux
+ *     "temperature": { "value": 22.5 },   // °C, 1 decimal place
+ *     "humidity":    { "value": 58 },      // %, integer
+ *     "light":       { "value": 412 }      // lux, integer
  *   },
  *   "batteryStatus": { "percentage": 87 }
  * }
+ *
+ * OLED dot key (bottom-right corner):
+ *   ●  solid   = sensor CONNECTED, last POST succeeded
+ *   ○  hollow  = sensor DISCONNECTED
+ *   (no dot)   = GET or POST error
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClientSecure.h>   // ← HTTPS support
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -63,9 +69,6 @@ const char* SENSOR_ID     = "YOUR_SENSOR_ID";
 
 // API key – generate in UniFi OS → Settings → API Keys (read-only is sufficient)
 const char* PROTECT_API_KEY = "YOUR_UNIFI_API_KEY";
-
-// Full GET URL (assembled at runtime from the constants above)
-// https://<PROTECT_HOST>/proxy/protect/integration/v1/sensors/<SENSOR_ID>
 
 // POST endpoint – Azure / cloud Functions URL
 // e.g. "https://my-app.azurewebsites.net/api/readings"
@@ -88,13 +91,16 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ─── GLOBALS ───────────────────────────────────────────────────────────────────
 
-float  g_temperature  = 0.0;
-float  g_humidity     = 0.0;
-float  g_light        = 0.0;
-int    g_battery      = -1;     // -1 = unknown
-String g_sensorState  = "";     // CONNECTED / DISCONNECTED / etc.
-bool   g_hasData      = false;
-String g_statusMsg    = "Starting...";
+float  g_temperature = 0.0;
+int    g_humidity    = 0;     // integer – Protect reports whole % values
+int    g_light       = 0;     // integer – Protect reports whole lux values
+int    g_battery     = -1;    // -1 = unknown
+String g_sensorState = "";    // "CONNECTED" / "DISCONNECTED" / etc.
+bool   g_hasData     = false;
+
+// Three-state dot indicator
+enum DotState { DOT_NONE, DOT_SOLID, DOT_HOLLOW };
+DotState g_dotState = DOT_NONE;
 
 unsigned long g_lastPoll = 0;
 
@@ -103,7 +109,6 @@ unsigned long g_lastPoll = 0;
 bool fetchSensorData();
 bool postSensorData();
 void updateDisplay();
-void showStatus(const String& line1, const String& line2 = "");
 String buildGetUrl();
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -120,11 +125,15 @@ void setup() {
   }
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  showStatus("UniFi Protect", "Sensor Bridge");
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("UniFi Protect");
+  display.setCursor(0, 36);
+  display.println("Sensor Bridge");
+  display.display();
   delay(1500);
 
   // ── Wi-Fi ──────────────────────────────────────────────────────────────────
-  showStatus("Connecting WiFi...", WIFI_SSID);
   Serial.printf("Connecting to %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -135,22 +144,18 @@ void setup() {
     Serial.print(".");
     if (millis() - wifiStart > 20000) {
       Serial.println("\nWi-Fi timeout. Restarting...");
-      showStatus("WiFi timeout!", "Restarting...");
       delay(2000);
       ESP.restart();
     }
   }
   Serial.println();
   Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-  showStatus("WiFi OK", WiFi.localIP().toString());
-  delay(1000);
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi lost – reconnecting...");
-    showStatus("WiFi lost...", "Reconnecting");
     WiFi.reconnect();
     delay(5000);
     return;
@@ -160,28 +165,25 @@ void loop() {
   if (g_lastPoll == 0 || now - g_lastPoll >= POLL_INTERVAL_MS) {
     g_lastPoll = now;
 
-    showStatus("Fetching...", "UniFi Protect");
-
     if (fetchSensorData()) {
       Serial.printf(
-        "Sensor: state=%s  temp=%.1f°C  hum=%.1f%%  light=%.0flux  bat=%d%%\n",
+        "Sensor: state=%s  temp=%.1f C  hum=%d%%  light=%d lux  bat=%d%%\n",
         g_sensorState.c_str(), g_temperature, g_humidity, g_light, g_battery
       );
 
-      showStatus("Posting data...", "");
-
       if (postSensorData()) {
-        g_statusMsg = "POST OK";
         Serial.println("POST succeeded.");
+        // Dot reflects sensor connection state after a successful POST
+        g_dotState = (g_sensorState == "CONNECTED") ? DOT_SOLID : DOT_HOLLOW;
       } else {
-        g_statusMsg = "POST failed";
         Serial.println("POST failed.");
+        g_dotState = DOT_NONE;  // no dot = something went wrong
       }
 
       g_hasData = true;
     } else {
-      g_statusMsg = "GET failed";
       Serial.println("Sensor fetch failed.");
+      g_dotState = DOT_NONE;
     }
 
     updateDisplay();
@@ -201,13 +203,13 @@ String buildGetUrl() {
 
 // ───────────────────────────────────────────────────────────────────────────────
 // GET sensor data from UniFi Protect
-// Parses the nested stats.temperature.value / stats.humidity.value /
-// stats.light.value fields from the API response.
+// Temperature is stored as float (1 d.p.); humidity and light are integers
+// as Protect returns whole numbers for both.
 // Returns true on success.
 // ───────────────────────────────────────────────────────────────────────────────
 bool fetchSensorData() {
   WiFiClientSecure client;
-  client.setInsecure();   // Skip cert verification – UniFi uses self-signed certs
+  client.setInsecure();  // ⚠ skips TLS cert verification – LAN use only
 
   HTTPClient http;
   String url = buildGetUrl();
@@ -235,25 +237,14 @@ bool fetchSensorData() {
   String payload = http.getString();
   http.end();
 
-  // Debug – comment out if the payload is large
-  Serial.println("--- Payload ---");
-  Serial.println(payload);
-  Serial.println("---------------");
-
-  // The Protect sensor JSON can be large; use a generous filter to extract only
-  // what we need and keep heap usage low on the ESP8266.
-  //
-  // Full path: stats → temperature/humidity/light → value
-  //            batteryStatus → percentage
-  //            state
+  // Filter to only the fields we need – keeps heap usage low on ESP8266
   StaticJsonDocument<256> filter;
-  filter["state"]                      = true;
+  filter["state"]                         = true;
   filter["stats"]["temperature"]["value"] = true;
   filter["stats"]["humidity"]["value"]    = true;
   filter["stats"]["light"]["value"]       = true;
   filter["batteryStatus"]["percentage"]   = true;
 
-  // Use a larger doc for the filtered parse (filtered responses are small)
   StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
 
@@ -263,34 +254,35 @@ bool fetchSensorData() {
     return false;
   }
 
-  // Validate the key fields exist
-  if (!doc["stats"]["temperature"]["value"].is<float>() &&
-      !doc["stats"]["temperature"]["value"].is<int>()) {
+  // Validate a required field is present
+  JsonVariant tempVal = doc["stats"]["temperature"]["value"];
+  if (tempVal.isNull()) {
     Serial.println("JSON missing stats.temperature.value – check sensor ID / API key.");
     return false;
   }
 
   g_sensorState = doc["state"] | "UNKNOWN";
   g_temperature = doc["stats"]["temperature"]["value"].as<float>();
-  g_humidity    = doc["stats"]["humidity"]["value"].as<float>();
-  g_light       = doc["stats"]["light"]["value"].as<float>();
+  g_humidity    = doc["stats"]["humidity"]["value"].as<int>();
+  g_light       = doc["stats"]["light"]["value"].as<int>();
   g_battery     = doc["batteryStatus"]["percentage"] | -1;
 
   return true;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// POST the latest readings to the backend API
-// Body:   { "temperature": 23.4, "humidity": 58.2, "light": 420 }
+// POST the latest readings to the backend API.
+// All three values are sent as numbers with 1 decimal place, matching the
+// precision of the UniFi Protect API output.
+// Body:   { "temperature": 22.5, "humidity": 58, "light": 412 }
 // Header: x-api-key: <POST_API_KEY>
 // Returns true on HTTP 200 or 201.
 // ───────────────────────────────────────────────────────────────────────────────
 bool postSensorData() {
-  // POST endpoint is always HTTPS
   WiFiClientSecure secureClient;
-  secureClient.setInsecure();   // POST target may also use a managed/trusted cert;
-                                // setInsecure keeps things simple — swap in a
-                                // fingerprint or CA cert if you need strict validation
+  // No setInsecure() here – the cloud endpoint uses a certificate issued by a
+  // recognised public CA, so BearSSL validates it automatically using the
+  // built-in CA bundle shipped with the ESP8266 board package.
 
   HTTPClient http;
 
@@ -303,11 +295,12 @@ bool postSensorData() {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-api-key", POST_API_KEY);
 
-  // Payload matches the API spec exactly – no extra fields
+  // Serialise floats to exactly 1 decimal place so the JSON body
+  // sends e.g. 22.5 not 22.500001 or 22
   StaticJsonDocument<96> doc;
   doc["temperature"] = serialized(String(g_temperature, 1));
-  doc["humidity"]    = serialized(String(g_humidity, 1));
-  doc["light"]       = (int)g_light;
+  doc["humidity"]    = g_humidity;
+  doc["light"]       = g_light;
 
   String body;
   serializeJson(doc, body);
@@ -322,32 +315,26 @@ bool postSensorData() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Render the latest values on the OLED
+// Render the latest values on the OLED.
+// The display is only ever updated here – no transient "fetching" screens.
+//
 // Layout:
-//   ┌─────────────────────────┐
-//   │ UniFi Protect  POST OK  │  ← header bar (inverted)
-//   │ Temp:  22.5 °C          │
-//   │ Hum:   58.3 %           │
-//   │ Light: 412 lux  Bat:87% │
-//   └─────────────────────────┘
+//   ┌──────────────────────────────┐
+//   │ UniFi Protect                │  ← inverted header bar
+//   │ Temp:  22.5 C                │
+//   │ Hum:   58.3 %                │
+//   │ Lux:412.0  Bat:87%        ●  │  ← dot: ●=ok  ○=disconnected  (none)=error
+//   └──────────────────────────────┘
 // ───────────────────────────────────────────────────────────────────────────────
 void updateDisplay() {
   display.clearDisplay();
 
-  // ── Header ─────────────────────────────────────────────────────────────────
+  // ── Header bar ─────────────────────────────────────────────────────────────
   display.fillRect(0, 0, SCREEN_WIDTH, 12, SSD1306_WHITE);
   display.setTextSize(1);
   display.setTextColor(SSD1306_BLACK);
   display.setCursor(2, 2);
   display.print("UniFi Protect");
-
-  // Right-align status string in the header
-  int16_t  sx, sy;
-  uint16_t sw, sh;
-  display.getTextBounds(g_statusMsg, 0, 0, &sx, &sy, &sw, &sh);
-  display.setCursor(SCREEN_WIDTH - (int)sw - 2, 2);
-  display.print(g_statusMsg);
-
   display.setTextColor(SSD1306_WHITE);
 
   if (!g_hasData) {
@@ -377,7 +364,7 @@ void updateDisplay() {
   display.print("Hum: ");
   display.setTextSize(2);
   display.setCursor(42, 32);
-  snprintf(buf, sizeof(buf), "%.1f", g_humidity);
+  snprintf(buf, sizeof(buf), "%d", g_humidity);
   display.print(buf);
   display.setTextSize(1);
   display.print(" %");
@@ -385,7 +372,7 @@ void updateDisplay() {
   // ── Light + Battery ────────────────────────────────────────────────────────
   display.setTextSize(1);
   display.setCursor(0, 54);
-  snprintf(buf, sizeof(buf), "Lux:%.0f", g_light);
+  snprintf(buf, sizeof(buf), "Lux:%d", g_light);
   display.print(buf);
 
   if (g_battery >= 0) {
@@ -393,29 +380,18 @@ void updateDisplay() {
     display.print(buf);
   }
 
-  // Sensor connection state indicator (small dot in bottom-right)
-  bool connected = (g_sensorState == "CONNECTED");
-  if (connected) {
-    display.fillCircle(SCREEN_WIDTH - 4, 57, 3, SSD1306_WHITE);  // solid = connected
-  } else {
-    display.drawCircle(SCREEN_WIDTH - 4, 57, 3, SSD1306_WHITE);  // hollow = disconnected
+  // ── Status dot (bottom-right) ───────────────────────────────────────────────
+  // ●  DOT_SOLID   – sensor connected, last POST succeeded
+  // ○  DOT_HOLLOW  – sensor disconnected (but comms working)
+  // (none) DOT_NONE – GET or POST failed
+  const int dotX = SCREEN_WIDTH - 4;
+  const int dotY = 57;
+  if (g_dotState == DOT_SOLID) {
+    display.fillCircle(dotX, dotY, 3, SSD1306_WHITE);
+  } else if (g_dotState == DOT_HOLLOW) {
+    display.drawCircle(dotX, dotY, 3, SSD1306_WHITE);
   }
+  // DOT_NONE: nothing drawn
 
-  display.display();
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Helper: two-line status screen for startup / transitions
-// ───────────────────────────────────────────────────────────────────────────────
-void showStatus(const String& line1, const String& line2) {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 20);
-  display.println(line1);
-  if (line2.length() > 0) {
-    display.setCursor(0, 36);
-    display.println(line2);
-  }
   display.display();
 }
