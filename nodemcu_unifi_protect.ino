@@ -280,9 +280,9 @@ bool fetchSensorData() {
 // ───────────────────────────────────────────────────────────────────────────────
 bool postSensorData() {
   WiFiClientSecure secureClient;
-  // No setInsecure() here – the cloud endpoint uses a certificate issued by a
-  // recognised public CA, so BearSSL validates it automatically using the
-  // built-in CA bundle shipped with the ESP8266 board package.
+  secureClient.setInsecure();   // POST target may also use a managed/trusted cert;
+                                // setInsecure keeps things simple — swap in a
+                                // fingerprint or CA cert if you need strict validation
 
   HTTPClient http;
 
